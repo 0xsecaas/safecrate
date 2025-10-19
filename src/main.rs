@@ -1,8 +1,11 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::{command, Parser, Subcommand};
 use std::fs;
-use std::path::PathBuf;
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+const DOCKER_IMAGE_NAME: &str = "safecrate_default";
+const CONTAINER_SUFFIX: &str = "isolated";
 
 /// Safecrate — safely open and build untrusted code in isolated Docker sandboxes.
 #[derive(Parser)]
@@ -75,26 +78,26 @@ fn main() -> Result<()> {
 
 /// Build a Docker image for isolated (by default Rust + Neovim) environment.
 fn init(dockerfile: Option<PathBuf>) -> Result<()> {
-    // If user provides a Dockerfile, use it
     let dockerfile_path = if let Some(path) = dockerfile {
         path
     } else {
-        // Otherwise, write embedded template to a temp file
         let dockerfile_content = include_str!("Dockerfile.template");
         let tmp_path = std::env::temp_dir().join("Dockerfile.safecrate");
-        fs::write(&tmp_path, dockerfile_content)?;
+        fs::write(&tmp_path, dockerfile_content)
+            .context("Failed to write temporary Dockerfile")?;
         tmp_path
     };
 
-    let status = Command::new("docker")
-        .args(["build", "-t", "safecrate_default", "-f"])
-        .arg(&dockerfile_path)
-        .arg(".")
-        .status()?;
+    let args = &[
+        "build",
+        "-t",
+        DOCKER_IMAGE_NAME,
+        "-f",
+        dockerfile_path.to_str().unwrap(),
+        ".",
+    ];
 
-    if !status.success() {
-        eprint!("Docker build failed!");
-    }
+    run_docker_command(args, "Docker build failed")?;
 
     println!("\n✅ Built the base image!");
     println!("⚠️  WARNING: Running untrusted code in Docker is NOT 100% secure.");
@@ -105,54 +108,33 @@ fn init(dockerfile: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// Run container with isolated encironment and mount the given directory.
+/// Run container with isolated environment and mount the given directory.
 fn open(dir: PathBuf, cmd: String, keep_container: bool, no_network: bool) -> Result<()> {
-    let abs_dir = std::fs::canonicalize(&dir)?;
-    let project_name = abs_dir
-        .file_name()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| anyhow!("Invalid directory name"))?;
+    let container_name = get_container_name(&dir)?;
 
-    let container_name = format!("{}_isolated", project_name);
-
-    let mut docker_args = vec![String::from("run"), String::from("-it")];
+    let mut docker_args = vec!["run", "-it"];
     if !keep_container {
-        docker_args.push(String::from("--rm"));
+        docker_args.push("--rm");
     }
-    docker_args.push(String::from("--name"));
-    docker_args.push(container_name);
+    docker_args.extend(&["--name", &container_name]);
 
     if !no_network {
-        docker_args.push(String::from("--network"));
-        docker_args.push(String::from("bridge"));
-    }
-    docker_args.push(String::from("-v"));
-    docker_args.push(format!("{}:/workspace", abs_dir.display()));
-    docker_args.push(String::from("-w"));
-    docker_args.push(String::from("/workspace"));
-    docker_args.push(String::from("safecrate_default"));
-
-    // Split cmd into words (space-separated)
-    docker_args.extend(cmd.split_whitespace().map(str::to_string));
-
-    let status = Command::new("docker").args(docker_args).status()?;
-    if !status.success() {
-        return Err(anyhow!("Failed to open container"));
+        docker_args.extend(&["--network", "bridge"]);
     }
 
-    Ok(())
+    let abs_dir = std::fs::canonicalize(&dir)?;
+    let volume_mapping = format!("{}:/workspace", abs_dir.display());
+    docker_args.extend(&["-v", &volume_mapping, "-w", "/workspace"]);
+    docker_args.push(DOCKER_IMAGE_NAME);
+    docker_args.extend(&["sh", "-c", &cmd]);
+
+    run_docker_command(&docker_args, "Failed to open container")
 }
 
 /// Resume a previously created container for the given directory.
 fn resume(dir: PathBuf) -> Result<()> {
-    let abs_dir = std::fs::canonicalize(&dir)?;
-    let project_name = abs_dir
-        .file_name()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| anyhow!("Invalid directory name"))?;
-    let container_name = format!("{}_isolated", project_name);
+    let container_name = get_container_name(&dir)?;
 
-    // Check if container exists
     let output = Command::new("docker")
         .args([
             "ps",
@@ -171,25 +153,12 @@ fn resume(dir: PathBuf) -> Result<()> {
         ));
     }
 
-    // Attach interactively
-    let status = Command::new("docker")
-        .args(["start", "-ai", &container_name])
-        .status()?;
-
-    if !status.success() {
-        return Err(anyhow!("Failed to resume container"));
-    }
-
-    Ok(())
+    run_docker_command(&["start", "-ai", &container_name], "Failed to resume container")
 }
 
+/// Remove a previously created container for the given directory.
 fn remove(dir: PathBuf, force: bool) -> Result<()> {
-    let abs_dir = std::fs::canonicalize(&dir)?;
-    let project_name = abs_dir
-        .file_name()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| anyhow!("Invalid directory name"))?;
-    let container_name = format!("{}_isolated", project_name);
+    let container_name = get_container_name(&dir)?;
 
     let mut args = vec!["rm"];
     if force {
@@ -197,12 +166,37 @@ fn remove(dir: PathBuf, force: bool) -> Result<()> {
     }
     args.push(&container_name);
 
-    let status = Command::new("docker").args(&args).status()?;
-
-    if !status.success() {
-        return Err(anyhow!("Failed to remove container"));
-    }
+    run_docker_command(&args, "Failed to remove container")?;
 
     println!("✅ Removed container {}", container_name);
+    Ok(())
+}
+
+/// Helper to get the container name from a directory path.
+fn get_container_name(dir: &Path) -> Result<String> {
+    let abs_dir = std::fs::canonicalize(dir)?;
+    let project_name = abs_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| anyhow!("Invalid directory name: {}", dir.display()))?;
+    Ok(format!("{}_{}", project_name, CONTAINER_SUFFIX))
+}
+
+/// Helper to run a Docker command and provide better error context.
+fn run_docker_command(args: &[&str], error_message: &str) -> Result<()> {
+    let mut command = Command::new("docker");
+    command.args(args).stdout(Stdio::inherit()).stderr(Stdio::inherit());
+
+    let status = command.status().context(format!(
+        "Failed to execute docker command. Is docker installed and running?"
+    ))?;
+
+    if !status.success() {
+        return Err(anyhow!(
+            "{}. Docker command exited with non-zero status.",
+            error_message
+        ));
+    }
+
     Ok(())
 }
