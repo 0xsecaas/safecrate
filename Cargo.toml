@@ -1,6 +1,6 @@
 [package]
 name = "safecrate"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "A CLI tool to safely open, build, and inspect untrusted source code in isolated Docker containers, protecting your system from potentially malicious projects."
 license = "MIT"
