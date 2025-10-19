@@ -1,0 +1,24 @@
+FROM rust:1.88.0-slim
+
+# Install dependencies
+RUN apt-get update && apt-get install -y \
+    curl git ninja-build gettext nodejs npm cmake tar gzip unzip build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install neovim from source (>= 0.9)
+RUN git clone --depth 1 https://github.com/neovim/neovim /tmp/neovim \
+    && cd /tmp/neovim && make CMAKE_BUILD_TYPE=Release install \
+    && rm -rf /tmp/neovim
+
+# Install LazyVim starter config
+RUN mkdir -p /root/.config/nvim \
+    && git clone --depth 1 https://github.com/LazyVim/starter /root/.config/nvim \
+    && rm -rf /root/.config/nvim/.git
+
+# Pre-warm LazyVim plugins and install selected Tree-sitter parsers + Rust Analyzer
+RUN nvim --headless "+Lazy! sync" \
+  "+TSInstall rust lua python json bash" \
+  "+MasonInstall rust-analyzer"\
+  "+qall"
+
+WORKDIR /workspace
